@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Screen Reader</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: #111;
+            font-family: sans-serif;
+        }
+
+        .frame {
+            background-color: rgba(0,0,0,0.5);
+            width: 860px;
+            padding: 36px 40px;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            color: white;
+        }
+
+        h3 {
+            font-size: 16px;
+            font-weight: 500;
+            margin-bottom: 24px;
+            color: rgba(255,255,255,0.85);
+            text-align: center;
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            margin-bottom: 24px;
+        }
+
+        button {
+            padding: 10px 24px;
+            border-radius: 6px;
+            border: none;
+            font-size: 14px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        #startBtn { background-color: #00e5e5; color: #111; }
+        #stopBtn  { background: rgba(255,255,255,0.1); color: white;
+                    border: 1px solid rgba(255,255,255,0.2); }
+
+        .status-bar {
+            text-align: center;
+            font-size: 13px;
+            color: rgba(255,255,255,0.45);
+            margin-bottom: 20px;
+            min-height: 20px;
+        }
+        .status-bar.active { color: #00e5e5; }
+        .status-bar.error  { color: #ff6b6b; }
+
+        /* Small live preview — confirms the stream is real */
+        #preview {
+            width: 100%;
+            max-height: 160px;
+            object-fit: contain;
+            border-radius: 6px;
+            border: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 16px;
+            display: none;
+            background: #000;
+        }
+
+        .output-box {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            padding: 16px 20px;
+            min-height: 120px;
+            max-height: 260px;
+            overflow-y: auto;
+        }
+
+        .output-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: rgba(255,255,255,0.3);
+            margin-bottom: 10px;
+        }
+
+        #extractedText {
+            font-size: 13px;
+            line-height: 1.7;
+            color: rgba(255,255,255,0.8);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .meta-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: rgba(255,255,255,0.25);
+            margin-top: 12px;
+        }
+
+        canvas { display: none; }
+    </style>
+</head>
+<body>
+<div class="frame">
+    <h3>Screen content detector</h3>
+
+    <div class="controls">
+        <button id="startBtn">Detect screen content</button>
+        <button id="stopBtn" disabled>Stop</button>
+    </div>
+
+    <div class="status-bar" id="status">Idle — press the button to begin</div>
+
+    <!-- Small preview so you can confirm the stream is live -->
+    <video id="preview" autoplay muted playsinline></video>
+
+    <div class="output-box">
+        <div class="output-label">Extracted text</div>
+        <div id="extractedText">Nothing captured yet.</div>
+    </div>
+
+    <div class="meta-row">
+        <span id="captureCount">0 captures</span>
+        <span id="lastCapture">—</span>
+    </div>
+</div>
+
+<!-- Off-screen canvas used only for ImageCapture fallback -->
+<canvas id="internalCanvas"></canvas>
+
+<script>
+    const API_URL     = 'http://localhost:8000/capture';
+    const INTERVAL_MS = 2000;
+    const MAX_CAPTURES = 50;
+
+    const startBtn   = document.getElementById('startBtn');
+    const stopBtn    = document.getElementById('stopBtn');
+    const statusEl   = document.getElementById('status');
+    const outputEl   = document.getElementById('extractedText');
+    const countEl    = document.getElementById('captureCount');
+    const lastEl     = document.getElementById('lastCapture');
+    const preview    = document.getElementById('preview');
+    const canvas     = document.getElementById('internalCanvas');
+    const ctx        = canvas.getContext('2d');
+
+    let stream       = null;
+    let captureTimer = null;
+    let captureCount = 0;
+    let imageCapture = null;
+    const sessionId  = 'session_' + Date.now();
+
+    startBtn.onclick = async () => {
+        try {
+            setStatus('Requesting screen access…', '');
+
+            stream = await navigator.mediaDevices.getDisplayMedia({
+                video: { cursor: 'always' },
+                audio: false
+            });
+
+            const track = stream.getVideoTracks()[0];
+
+            // Show small live preview so you can confirm the stream is real
+            preview.srcObject = stream;
+            preview.style.display = 'block';
+
+            // Use ImageCapture API if available (Chrome/Edge) — most reliable
+            if (typeof ImageCapture !== 'undefined') {
+                imageCapture = new ImageCapture(track);
+                setStatus('Stream live — using ImageCapture API', 'active');
+            } else {
+                // Fallback: video element canvas approach
+                imageCapture = null;
+                setStatus('Stream live — using canvas fallback', 'active');
+                // Give video time to paint first frame
+                await new Promise(r => setTimeout(r, 500));
+            }
+
+            startBtn.disabled = true;
+            stopBtn.disabled  = false;
+
+            stream.getVideoTracks()[0].onended = stopCapture;
+
+            captureTimer = setInterval(captureAndSend, INTERVAL_MS);
+            captureAndSend(); // fire immediately
+
+        } catch (err) {
+            if (err.name === 'NotAllowedError') {
+                setStatus('Permission denied.', 'error');
+            } else {
+                setStatus('Error: ' + err.message, 'error');
+            }
+        }
+    };
+
+    stopBtn.onclick = stopCapture;
+
+    function stopCapture() {
+        clearInterval(captureTimer);
+        if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+        preview.srcObject    = null;
+        preview.style.display = 'none';
+        imageCapture          = null;
+        setStatus('Stopped.', '');
+        startBtn.disabled = false;
+        stopBtn.disabled  = true;
+    }
+
+    async function captureAndSend() {
+        if (!stream) return;
+        if (captureCount >= MAX_CAPTURES) { stopCapture(); return; }
+
+        let imageB64;
+
+        try {
+            if (imageCapture) {
+                // PRIMARY: ImageCapture.grabFrame() — returns an ImageBitmap
+                // This does NOT need a visible video element
+                const bitmap = await imageCapture.grabFrame();
+                canvas.width  = bitmap.width;
+                canvas.height = bitmap.height;
+                ctx.drawImage(bitmap, 0, 0);
+                bitmap.close();
+                imageB64 = canvas.toDataURL('image/png');
+
+            } else {
+                // FALLBACK: draw from preview video element
+                canvas.width  = preview.videoWidth  || 1280;
+                canvas.height = preview.videoHeight || 720;
+                ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
+                imageB64 = canvas.toDataURL('image/png');
+            }
+
+            // Quick sanity check — a blank canvas encodes to a small string
+            // If the base64 is tiny the frame is empty, skip this capture
+            if (imageB64.length < 5000) {
+                setStatus('Frame was empty — retrying next interval…', 'error');
+                return;
+            }
+
+        } catch (err) {
+            setStatus('Frame grab failed: ' + err.message, 'error');
+            return;
+        }
+
+        // Send to Python
+        try {
+            const res = await fetch(API_URL, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    image_b64:  imageB64,
+                    timestamp:  new Date().toISOString(),
+                    session_id: sessionId
+                })
+            });
+
+            if (!res.ok) {
+                const err = await res.text();
+                throw new Error(err);
+            }
+
+            const data = await res.json();
+
+            outputEl.textContent = data.text && data.text.trim()
+                ? data.text
+                : '(No text detected in this frame)';
+
+            captureCount++;
+            countEl.textContent = captureCount + ' capture' + (captureCount !== 1 ? 's' : '');
+            lastEl.textContent  = 'Last: ' + new Date().toLocaleTimeString()
+                                + (data.xml_path ? ' → ' + data.xml_path : '');
+            setStatus('Reading screen content… conf=' + data.confidence, 'active');
+
+        } catch (err) {
+            outputEl.textContent = '[API error: ' + err.message + ']';
+            setStatus('API error — is Python running on port 8000?', 'error');
+        }
+    }
+
+    function setStatus(msg, cls) {
+        statusEl.textContent = msg;
+        statusEl.className   = 'status-bar ' + (cls || '');
+    }
+</script>
+</body>
+</html>
