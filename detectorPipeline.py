@@ -12,10 +12,10 @@ from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 from pydantic import BaseModel
 from xml.etree import ElementTree as ET
 
-# ── Tesseract path ────────────────────────────────────────────────────────────
+from xml_extractor import build_ai_prompt, save_key_points
+
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="Screen Reader API")
 
 app.add_middleware(
@@ -26,27 +26,21 @@ app.add_middleware(
 )
 
 OUTPUT_DIR = Path("captures")
-DEBUG_DIR  = Path("captures/debug")   # saved images so you can see what Tesseract receives
+DEBUG_DIR  = Path("captures/debug")
 OUTPUT_DIR.mkdir(exist_ok=True)
 DEBUG_DIR.mkdir(exist_ok=True)
 
-
-# ── Request model ─────────────────────────────────────────────────────────────
 class FramePayload(BaseModel):
     image_b64: str
     timestamp: str
     session_id: str
 
-
-# ── Module A: Frame decode ────────────────────────────────────────────────────
 def decode_frame(b64_string: str) -> Image.Image:
     if "," in b64_string:
         b64_string = b64_string.split(",")[1]
     raw_bytes = base64.b64decode(b64_string)
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
-
-# ── Module B: OCR ─────────────────────────────────────────────────────────────
 @dataclass
 class OCRResult:
     full_text: str
@@ -55,25 +49,20 @@ class OCRResult:
 
 
 def is_dark_image(img: Image.Image) -> bool:
-    """Returns True if the image has a dark background (like VS Code, terminals)."""
     grayscale      = img.convert("L")
     pixels         = list(grayscale.getdata())
     avg_brightness = sum(pixels) / len(pixels)
-    return avg_brightness < 128   # 0=black, 255=white
+    return avg_brightness < 128
 
 
 def preprocess(img: Image.Image) -> Image.Image:
-    # Scale up — Tesseract needs large text to read accurately
     w, h = img.size
     if w < 1600:
         scale = 2
         img   = img.resize((w * scale, h * scale), Image.LANCZOS)
 
-    img = img.convert("L")   # grayscale
+    img = img.convert("L")
 
-    # KEY FIX: invert dark-background screens
-    # Tesseract is trained on BLACK text on WHITE background.
-    # VS Code dark theme is the opposite — so we flip it.
     if is_dark_image(img):
         img = ImageOps.invert(img)
 
@@ -85,7 +74,6 @@ def preprocess(img: Image.Image) -> Image.Image:
 def run_ocr(img: Image.Image, session_id: str, capture_num: int) -> OCRResult:
     processed = preprocess(img)
 
-    # Save the processed image so you can inspect it in captures/debug/
     debug_path = DEBUG_DIR / f"{session_id}_cap{capture_num}.png"
     processed.save(debug_path)
 
@@ -119,7 +107,6 @@ def run_ocr(img: Image.Image, session_id: str, capture_num: int) -> OCRResult:
             best_words = words
             best_text  = " ".join(w["text"] for w in words)
 
-    # Fallback to plain string if data approach got nothing
     if not best_text.strip():
         best_text = pytesseract.image_to_string(processed, config="--psm 6").strip()
 
@@ -130,7 +117,6 @@ def run_ocr(img: Image.Image, session_id: str, capture_num: int) -> OCRResult:
     )
 
 
-# ── Module C: Content parser ──────────────────────────────────────────────────
 @dataclass
 class ContentBlock:
     block_type: str
@@ -161,9 +147,7 @@ def parse_content(raw_text: str) -> List[ContentBlock]:
     return blocks
 
 
-# ── Module D: XML writer — one file per session, append each capture ──────────
 session_capture_counts: dict = {}
-
 last_text_per_session: dict = {}
 
 def write_xml(
@@ -175,7 +159,6 @@ def write_xml(
     filename = OUTPUT_DIR / f"session_{session_id}.xml"
     ts       = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-    # Load existing file or create a new root
     if filename.exists():
         tree = ET.parse(filename)
         root = tree.getroot()
@@ -212,7 +195,6 @@ def write_xml(
     return str(filename)
 
 
-# ── Endpoint ──────────────────────────────────────────────────────────────────
 @app.post("/capture")
 async def capture_frame(payload: FramePayload):
     try:
@@ -221,7 +203,6 @@ async def capture_frame(payload: FramePayload):
         image = decode_frame(payload.image_b64)
         ocr   = run_ocr(image, payload.session_id, capture_num)
 
-        # ── Deduplication check ──────────────────────────────────
         last = last_text_per_session.get(payload.session_id, "")
         if ocr.full_text.strip() and ocr.full_text.strip() == last.strip():
             return {
@@ -232,10 +213,31 @@ async def capture_frame(payload: FramePayload):
                 "word_count": 0,
             }
         last_text_per_session[payload.session_id] = ocr.full_text
-        # ────────────────────────────────────────────────────────
 
         blocks   = parse_content(ocr.full_text)
         xml_path = write_xml(blocks, payload.session_id, ocr.confidence, ocr.full_text)
+
+        # Extract key points → save to JSON
+        key_points = save_key_points(xml_path)
+        print(f"[key_points] saved {len(key_points['key_points'])} points → captures/key_points.json")
+
+        # Build prompt from JSON key points instead of raw XML
+        points_text = "\n".join(
+            f"- [{p['type']}] {p['content']}"
+            for p in key_points["key_points"]
+        )
+
+        prompt = (
+            "The following key points were extracted from the user's screen:\n\n"
+            + points_text
+            + "\n\nProvide helpful assistance based on what the user is viewing."
+        )
+
+        print("\n" + "=" * 60)
+        print("PROMPT READY FOR AI:")
+        print("=" * 60)
+        print(prompt)
+        print("=" * 60 + "\n")
 
         print(f"[cap#{capture_num+1}] conf={ocr.confidence} | "
               f"words={len(ocr.full_text.split())} | "
@@ -252,7 +254,5 @@ async def capture_frame(payload: FramePayload):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run("detectorPipeline:app", host="0.0.0.0", port=8000, reload=True)
