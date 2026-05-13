@@ -12,16 +12,22 @@ from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 from pydantic import BaseModel
 from xml.etree import ElementTree as ET
 
-from xml_extractor import build_ai_prompt, save_key_points
+from xml_extractor_v2 import build_ai_prompt, save_key_points, _content_fingerprint
+
+# ── Voice pipeline — imported as a router, NOT merged ────────────────────────
+from voicepipeline import router as voice_router
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-app = FastAPI(title="Screen Reader API")
+app = FastAPI(title="Screen + Voice Reader API")
+
+# ── Mount voice endpoints (/transcribe, /voice-stream, /voice-health) ────────
+app.include_router(voice_router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
@@ -30,10 +36,12 @@ DEBUG_DIR  = Path("captures/debug")
 OUTPUT_DIR.mkdir(exist_ok=True)
 DEBUG_DIR.mkdir(exist_ok=True)
 
+
 class FramePayload(BaseModel):
-    image_b64: str
-    timestamp: str
+    image_b64:  str
+    timestamp:  str
     session_id: str
+
 
 def decode_frame(b64_string: str) -> Image.Image:
     if "," in b64_string:
@@ -41,10 +49,11 @@ def decode_frame(b64_string: str) -> Image.Image:
     raw_bytes = base64.b64decode(b64_string)
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
+
 @dataclass
 class OCRResult:
-    full_text: str
-    words: List[dict]
+    full_text:  str
+    words:      List[dict]
     confidence: float
 
 
@@ -111,9 +120,9 @@ def run_ocr(img: Image.Image, session_id: str, capture_num: int) -> OCRResult:
         best_text = pytesseract.image_to_string(processed, config="--psm 6").strip()
 
     return OCRResult(
-        full_text=best_text,
-        words=best_words,
-        confidence=round(best_conf, 2),
+        full_text  = best_text,
+        words      = best_words,
+        confidence = round(best_conf, 2),
     )
 
 
@@ -147,14 +156,15 @@ def parse_content(raw_text: str) -> List[ContentBlock]:
     return blocks
 
 
-session_capture_counts: dict = {}
-last_text_per_session: dict = {}
+session_capture_counts:          dict = {}
+last_fingerprint_per_session:    dict = {}
+
 
 def write_xml(
-    blocks: List[ContentBlock],
+    blocks:     List[ContentBlock],
     session_id: str,
     confidence: float,
-    raw_text: str,
+    raw_text:   str,
 ) -> str:
     filename = OUTPUT_DIR / f"session_{session_id}.xml"
     ts       = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -171,9 +181,9 @@ def write_xml(
 
     capture_el = ET.SubElement(
         root, "capture",
-        number=str(capture_num),
-        timestamp=ts,
-        ocr_confidence=str(confidence),
+        number        = str(capture_num),
+        timestamp     = ts,
+        ocr_confidence= str(confidence),
     )
 
     if blocks:
@@ -203,8 +213,10 @@ async def capture_frame(payload: FramePayload):
         image = decode_frame(payload.image_b64)
         ocr   = run_ocr(image, payload.session_id, capture_num)
 
-        last = last_text_per_session.get(payload.session_id, "")
-        if ocr.full_text.strip() and ocr.full_text.strip() == last.strip():
+        current_fp = _content_fingerprint(ocr.full_text)
+        last_fp    = last_fingerprint_per_session.get(payload.session_id, "")
+
+        if ocr.full_text.strip() and current_fp == last_fp:
             return {
                 "status":     "skipped",
                 "text":       ocr.full_text,
@@ -212,16 +224,15 @@ async def capture_frame(payload: FramePayload):
                 "confidence": ocr.confidence,
                 "word_count": 0,
             }
-        last_text_per_session[payload.session_id] = ocr.full_text
+
+        last_fingerprint_per_session[payload.session_id] = current_fp
 
         blocks   = parse_content(ocr.full_text)
         xml_path = write_xml(blocks, payload.session_id, ocr.confidence, ocr.full_text)
 
-        # Extract key points → save to JSON
         key_points = save_key_points(xml_path)
-        print(f"[key_points] saved {len(key_points['key_points'])} points → captures/key_points.json")
+        print(f"[key_points] {len(key_points['key_points'])} points saved → captures/key_points.json")
 
-        # Build prompt from JSON key points instead of raw XML
         points_text = "\n".join(
             f"- [{p['type']}] {p['content']}"
             for p in key_points["key_points"]
@@ -253,6 +264,7 @@ async def capture_frame(payload: FramePayload):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 if __name__ == "__main__":
     uvicorn.run("detectorPipeline:app", host="0.0.0.0", port=8000, reload=True)
